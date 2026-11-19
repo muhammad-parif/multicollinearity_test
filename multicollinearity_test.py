@@ -3,20 +3,21 @@ import os.path
 import csv
 import numpy as np
 
-# Perbaikan Impor PyQt6 Compatibility
 from qgis.PyQt.QtCore import QLocale, QTranslator, QCoreApplication, Qt
 from qgis.PyQt.QtGui import QIcon, QCursor
 from qgis.PyQt.QtWidgets import QAction, QMessageBox, QApplication
 from qgis.core import (
     QgsSettings, 
     QgsRasterLayer, 
-    QgsFileWidget,
     QgsMessageLog,
     Qgis
 )
+from qgis.gui import QgsFileWidget 
+
 import processing
 
 from .multicollinearity_test_dialog import multicollinearity_testDialog
+
 
 class multicollinearity_test:
     """QGIS Plugin Implementation."""
@@ -72,12 +73,12 @@ class multicollinearity_test:
             self.iface.removeToolBarIcon(action)
 
     def run(self):
-        if self.first_start == True:
+        # PERBAIKAN FLAKE8: Menggunakan "is True"
+        if self.first_start is True:
             self.first_start = False
             self.dlg = multicollinearity_testDialog()
 
         self.dlg.show()
-        # Perbaikan kompatibilitas PyQt6 (menggunakan exec() alih-alih exec_())
         result = self.dlg.exec()
         
         if result:
@@ -94,33 +95,48 @@ class multicollinearity_test:
                 QMessageBox.warning(self.iface.mainWindow(), "Warning", "Please specify the output CSV file location!")
                 return
 
-            # Mengubah kursor agar pengguna tahu proses sedang berjalan
-            QApplication.setOverrideCursor(QCursor(Qt.WaitCursor))
+            # PERBAIKAN Qt6: Menggunakan Qt.CursorShape.WaitCursor
+            QApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
             
             try:
                 layers = []
-                base_crs = None
+                base_layer = None
                 
+                # --- LOGIKA 1: ALIGNMENT EXTENT, RESOLUSI, DAN CRS ---
                 for path in raster_files:
                     layer = QgsRasterLayer(path, os.path.basename(path))
                     if not layer.isValid():
-                        QgsMessageLog.logMessage(f"Invalid raster layer: {path}", "Multicollinearity Test", Qgis.Warning)
+                        # PERBAIKAN Qt6: Menggunakan Qgis.MessageLevel.Warning
+                        QgsMessageLog.logMessage(f"Invalid raster layer: {path}", "Multicollinearity Test", Qgis.MessageLevel.Warning)
                         continue
                         
-                    if base_crs is None:
-                        base_crs = layer.crs()
+                    if base_layer is None:
+                        # Jadikan raster pertama sebagai patokan ukuran dan koordinat
+                        base_layer = layer
+                        layers.append(layer)
+                        continue
                     
-                    if reproject_crs and layer.crs() != base_crs:
-                        params = {
-                            'INPUT': layer,
-                            'TARGET_CRS': base_crs,
-                            'OUTPUT': 'TEMPORARY_OUTPUT'
-                        }
-                        reprojected = processing.run("gdal:warpreproject", params)
-                        layer = QgsRasterLayer(reprojected['OUTPUT'], layer.name() + "_reproj")
-                    
-                    layers.append(layer)
+                    # Ekstrak informasi dari base_layer
+                    base_crs = base_layer.crs()
+                    b_ext = base_layer.extent()
+                    extent_str = f"{b_ext.xMinimum()},{b_ext.xMaximum()},{b_ext.yMinimum()},{b_ext.yMaximum()}"
+                    target_res = base_layer.rasterUnitsPerPixelX()
 
+                    # Gunakan GDAL Warp untuk memaksa extent dan resolusi agar sama persis
+                    target_crs = base_crs if reproject_crs else layer.crs()
+                    params = {
+                        'INPUT': layer,
+                        'TARGET_CRS': target_crs,
+                        'TARGET_EXTENT': extent_str,
+                        'TARGET_RESOLUTION': target_res,
+                        'OUTPUT': 'TEMPORARY_OUTPUT'
+                    }
+                    
+                    aligned = processing.run("gdal:warpreproject", params)
+                    aligned_layer = QgsRasterLayer(aligned['OUTPUT'], layer.name() + "_aligned")
+                    layers.append(aligned_layer)
+
+                # --- LOGIKA 2: EKSTRAKSI ARRAY ---
                 arrays = []
                 layer_names = []
                 nodata_values = []
@@ -133,33 +149,37 @@ class multicollinearity_test:
                     
                     block = provider.block(1, extent, cols, rows)
                     
-                    arr = np.array([block.value(row, col) for row in range(rows) for col in range(cols)])
+                    # Konversi ke dtype float agar np.isnan() bisa bekerja dengan aman pada TIF
+                    arr = np.array([block.value(row, col) for row in range(rows) for col in range(cols)], dtype=float)
                     nodata = provider.sourceNoDataValue(1)
                     
                     arrays.append(arr)
                     nodata_values.append(nodata)
                     layer_names.append(layer.name())
 
-                # Perbaikan Logika Matematis: Masking NoData secara serentak
-                min_len = min([len(a) for a in arrays])
-                arrays = [a[:min_len] for a in arrays] 
+                # Karena sudah di-align oleh GDAL, ukuran array pasti 100% sama. 
+                # Tidak perlu lagi dipotong menggunakan min_len.
                 data_matrix = np.vstack(arrays)
                 
-                # Buat mask untuk menyeleksi piksel yang valid (bukan NoData) di SEMUA raster
+                # --- LOGIKA 3: MASKING NaN DAN NoData SERENTAK ---
                 valid_pixels_mask = np.ones(data_matrix.shape[1], dtype=bool)
                 for i, nodata in enumerate(nodata_values):
+                    # Filter 1: Buang nilai NaN bawaan file (biasanya dari format TIF)
+                    valid_pixels_mask &= ~np.isnan(data_matrix[i])
+                    
+                    # Filter 2: Buang nilai metadata NoData (misal: -9999)
                     if nodata is not None:
                         valid_pixels_mask &= (data_matrix[i] != nodata)
                 
-                # Aplikasikan mask ke matriks
                 clean_data_matrix = data_matrix[:, valid_pixels_mask]
                 
-                # Pastikan masih ada data setelah NoData dibuang
                 if clean_data_matrix.shape[1] == 0:
-                    raise ValueError("All pixels resulted in NoData after alignment. Check your raster extents and overlap.")
+                    raise ValueError("All pixels resulted in NoData/NaN after alignment. Check your raster extents and overlaps.")
 
+                # Kalkulasi Pearson r
                 corr_matrix = np.corrcoef(clean_data_matrix)
 
+                # Ekspor ke CSV
                 with open(output_csv, mode='w', newline='') as file:
                     writer = csv.writer(file)
                     writer.writerow(['Variable'] + layer_names)
@@ -177,11 +197,10 @@ class multicollinearity_test:
                 QMessageBox.information(self.iface.mainWindow(), "Success", f"Analysis complete! CSV saved at:\n{output_csv}")
 
             except Exception as e:
-                # Log error penuh ke QGIS Message Log untuk debugging reviewer
                 import traceback
-                QgsMessageLog.logMessage(traceback.format_exc(), "Multicollinearity Test", Qgis.Critical)
+                # PERBAIKAN Qt6: Menggunakan Qgis.MessageLevel.Critical
+                QgsMessageLog.logMessage(traceback.format_exc(), "Multicollinearity Test", Qgis.MessageLevel.Critical)
                 QMessageBox.critical(self.iface.mainWindow(), "Error", f"A computational error occurred. See QGIS Message Log for details.\n\nError: {str(e)}")
             
             finally:
-                # Wajib mengembalikan kursor apapun yang terjadi
                 QApplication.restoreOverrideCursor()
